@@ -84,7 +84,7 @@ export async function urlContext(
         const result = await callApiStream(ctx, model, {
             contents,
             tools
-        }, onUpdate);
+        }, onUpdate, signal);
 
         const { text, sources } = applyCitations(result.text, result.groundingMetadata);
         

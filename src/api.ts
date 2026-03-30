@@ -66,6 +66,36 @@ export function getConfig(model: Model<any>): ProviderConfig {
     return PROVIDERS[model.provider] || PROVIDERS[model.api] || PROVIDERS["google-generative-ai"];
 }
 
+// --- Auth Compatibility Layer ---
+
+type ResolvedAuth = 
+    | { ok: true; apiKey?: string; headers?: Record<string, string>; }
+    | { ok: false; error: string; };
+
+/**
+ * Get API key and headers for a model.
+ * Compatible with both new pi versions (getApiKeyAndHeaders) and old versions (getApiKey).
+ */
+async function getAuth(ctx: ExtensionContext, model: Model<any>): Promise<ResolvedAuth> {
+    const registry = ctx.modelRegistry as any;
+    
+    // Try new API first (pi >= 0.63.0)
+    if (typeof registry.getApiKeyAndHeaders === 'function') {
+        return await registry.getApiKeyAndHeaders(model);
+    }
+    
+    // Fallback to old API (pi < 0.63.0)
+    if (typeof registry.getApiKey === 'function') {
+        const apiKey = await registry.getApiKey(model);
+        if (apiKey === undefined || apiKey === null) {
+            return { ok: false, error: "No API key configured for model" };
+        }
+        return { ok: true, apiKey };
+    }
+    
+    return { ok: false, error: "Model registry does not support API key retrieval" };
+}
+
 // --- Streaming API Call ---
 
 export interface StreamResult {
@@ -78,31 +108,47 @@ export async function callApiStream(
     ctx: ExtensionContext,
     model: Model<any>,
     body: any,
-    onUpdate?: AgentToolUpdateCallback
+    onUpdate?: AgentToolUpdateCallback,
+    signal?: AbortSignal
 ): Promise<StreamResult> {
     const config = getConfig(model);
-    const apiKey = await ctx.modelRegistry.getApiKey(model) || "";
+    const auth = await getAuth(ctx, model);
+    if (!auth.ok) {
+        throw new Error(auth.error || "Failed to get API key and headers");
+    }
 
+    // Extract projectId from apiKey for internal Google APIs (gemini-cli, antigravity)
+    // These providers return apiKey as JSON: {projectId, token}
     let projectId: string | undefined;
-    if (model.api !== "google-generative-ai") {
-        const parsed = JSON.parse(apiKey);
-        projectId = parsed.projectId;
+    if (model.api !== "google-generative-ai" && auth.apiKey) {
+        try {
+            const parsed = JSON.parse(auth.apiKey);
+            projectId = parsed.projectId;
+        } catch {
+            // Not a JSON string, ignore
+        }
     }
 
     const req = config.buildRequest(model, body, projectId);
 
     // Handle auth
-    if (model.api === "google-generative-ai") {
-        req.headers["x-goog-api-key"] = apiKey;
-    } else {
-        const parsed = JSON.parse(apiKey);
-        req.headers["Authorization"] = `Bearer ${parsed.token}`;
+    if (auth.headers) {
+        Object.assign(req.headers, auth.headers);
+    }
+    if (auth.apiKey) {
+        if (model.api === "google-generative-ai") {
+            req.headers["x-goog-api-key"] = auth.apiKey;
+        } else {
+            const parsed = JSON.parse(auth.apiKey);
+            req.headers["Authorization"] = `Bearer ${parsed.token}`;
+        }
     }
 
     const response = await fetch(req.url, {
         method: "POST",
         headers: req.headers,
-        body: JSON.stringify(req.body)
+        body: JSON.stringify(req.body),
+        signal
     });
 
     if (!response.ok) {
@@ -120,8 +166,14 @@ export async function callApiStream(
     let accumulatedText = "";
     let groundingMetadata: any;
     let urlContextMetadata: any;
+    let currentEventData = "";
+    let currentEventName = "";
 
     while (true) {
+        if (signal?.aborted) {
+            throw new Error("Request was aborted");
+        }
+
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -130,41 +182,70 @@ export async function callApiStream(
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const jsonStr = line.slice(5).trim();
-            if (!jsonStr) continue;
+            // Empty line indicates end of an event
+            if (line === "" || line === "\r") {
+                if (currentEventData) {
+                    // Process the complete event
+                    let chunk: any;
+                    try {
+                        chunk = JSON.parse(currentEventData);
+                    } catch {
+                        currentEventData = "";
+                        currentEventName = "";
+                        continue;
+                    }
 
-            let chunk: any;
-            try {
-                chunk = JSON.parse(jsonStr);
-            } catch {
+                    // Check for error in chunk (API errors are sent via SSE stream)
+                    if (chunk.error) {
+                        const errorMsg = chunk.error.message || JSON.stringify(chunk.error);
+                        throw new Error(`API error (${chunk.error.code || chunk.error.status || 'unknown'}): ${errorMsg}`);
+                    }
+
+                    // Unwrap response for internal APIs
+                    const data = chunk.response || chunk;
+                    const candidate = data.candidates?.[0];
+
+                    if (candidate?.content?.parts) {
+                        for (const part of candidate.content.parts) {
+                            if (part.text) {
+                                accumulatedText += part.text;
+                                // Stream update
+                                onUpdate?.({
+                                    content: [{ type: "text", text: accumulatedText }],
+                                    details: { streaming: true }
+                                });
+                            }
+                        }
+                    }
+
+                    // Capture metadata from final chunk
+                    if (candidate?.groundingMetadata) {
+                        groundingMetadata = candidate.groundingMetadata;
+                    }
+                    // Handle both camelCase and snake_case
+                    if (candidate?.urlContextMetadata || candidate?.url_context_metadata) {
+                        urlContextMetadata = candidate.urlContextMetadata || candidate.url_context_metadata;
+                    }
+                }
+                currentEventData = "";
+                currentEventName = "";
                 continue;
             }
 
-            // Unwrap response for internal APIs
-            const data = chunk.response || chunk;
-            const candidate = data.candidates?.[0];
-
-            if (candidate?.content?.parts) {
-                for (const part of candidate.content.parts) {
-                    if (part.text) {
-                        accumulatedText += part.text;
-                        // Stream update
-                        onUpdate?.({
-                            content: [{ type: "text", text: accumulatedText }],
-                            details: { streaming: true }
-                        });
-                    }
+            // Parse SSE field
+            if (line.startsWith("data:")) {
+                const data = line.slice(5).trim();
+                currentEventData = currentEventData ? currentEventData + "\n" + data : data;
+            } else if (line.startsWith("event:")) {
+                currentEventName = line.slice(6).trim();
+                // Check for error event type
+                if (currentEventName === "error") {
+                    // Next data line should contain error details
                 }
-            }
-
-            // Capture metadata from final chunk
-            if (candidate?.groundingMetadata) {
-                groundingMetadata = candidate.groundingMetadata;
-            }
-            // Handle both camelCase and snake_case
-            if (candidate?.urlContextMetadata || candidate?.url_context_metadata) {
-                urlContextMetadata = candidate.urlContextMetadata || candidate.url_context_metadata;
+            } else if (line.startsWith("id:")) {
+                // Event ID, can be ignored for now
+            } else if (line.startsWith(":")) {
+                // Comment line, ignore
             }
         }
     }

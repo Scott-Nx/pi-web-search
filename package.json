@@ -1,6 +1,6 @@
 {
   "name": "pi-web-search",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Web search and content analysis extension for pi, powered by Gemini API",
   "type": "module",
   "main": "dist/index.js",
@@ -25,12 +25,14 @@
   },
   "homepage": "https://github.com/ttttmr/pi-web-search#readme",
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.51.5",
+    "@mariozechner/pi-coding-agent": "^0.64.0",
     "@sinclair/typebox": "^0.32.15",
-    "typescript": "^5.0.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   }
 }

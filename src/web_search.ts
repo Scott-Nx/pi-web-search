@@ -51,7 +51,7 @@ export async function webSearch(
         const result = await callApiStream(ctx, model, {
             contents: [{ role: "user", parts: [{ text: prompt }] }],
             tools
-        }, onUpdate);
+        }, onUpdate, signal);
 
         const { text, sources } = applyCitations(result.text, result.groundingMetadata);
 
