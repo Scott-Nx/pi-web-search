@@ -1,6 +1,7 @@
-import type { ExtensionContext, AgentToolResult } from "@mariozechner/pi-coding-agent";
-import { type Model } from "@mariozechner/pi-ai";
-import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext, AgentToolResult } from "@earendil-works/pi-coding-agent";
+import { type Model } from "@earendil-works/pi-ai";
+import { truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { getProviderKind } from "./api.ts";
 
 // --- Formatting ---
 
@@ -14,63 +15,62 @@ export function formatResult(text: string, details: any): AgentToolResult<any> {
 
 // --- Model Selection ---
 
-export async function getModel(ctx: ExtensionContext): Promise<Model<any> | undefined> {
-    // flash first, big first: 3-flash -> 2.5-flash -> 2.0-flash
-    // provider priority: google-gemini-cli -> google-antigravity -> google -> google-generative-ai
-    const models = ctx.modelRegistry.getAvailable();
-    
-    const flashModels = [
+function isSupportedSearchModel(model: Model<any> | undefined): model is Model<any> {
+    if (!model) return false;
+    return getProviderKind(model) !== "unsupported";
+}
+
+function providerPriority(model: Model<any>): number {
+    const priorities = [
+        "google",
+        "google-generative-ai",
+        "openai",
+        "anthropic",
+    ];
+    const providerIndex = priorities.indexOf(model.provider);
+    if (providerIndex >= 0) return providerIndex;
+    return priorities.length;
+}
+
+function modelPriority(model: Model<any>): number {
+    const id = model.id;
+    const patterns = [
         /gemini-3.*flash/i,
         /gemini-2\.5.*flash/i,
         /gemini-2\.0.*flash/i,
         /gemini.*flash/i,
+        /gpt-5\..*mini/i,
+        /gpt-4\.1.*mini/i,
+        /gpt-4o-mini/i,
+        /claude.*haiku/i,
+        /claude.*sonnet/i,
     ];
-    
-    const providers = [
-        "google-gemini-cli",
-        "google-antigravity", 
-        "google",
-        "google-generative-ai",
-    ];
-    
-    // Filter to only Google-compatible models (those with supported api/provider)
-    const googleModels = models.filter(m => 
-        providers.includes(m.provider) ||
-        m.api === "google-generative-ai" || 
-        m.api === "google-gemini-cli"
-    );
-    
-    // Try each flash pattern in priority order
-    for (const pattern of flashModels) {
-        const matching = googleModels.filter(m => pattern.test(m.id));
-        if (matching.length === 0) continue;
-        
-        // Among matches, pick by provider priority
-        for (const provider of providers) {
-            const model = matching.find(m => m.provider === provider);
-            if (model) return model;
-        }
-        
-        // Fall back to first match if no priority provider found
-        return matching[0];
+    const patternIndex = patterns.findIndex((pattern) => pattern.test(id));
+    return patternIndex >= 0 ? patternIndex : patterns.length;
+}
+
+export async function getModel(ctx: ExtensionContext): Promise<Model<any> | undefined> {
+    // Use the current model first so the tool follows the user's selected provider.
+    // This lets pi --provider openai/anthropic/google automatically pick the matching API.
+    if (isSupportedSearchModel(ctx.model)) {
+        return ctx.model;
     }
-    
-    // No flash model found, try any Google model by provider priority
-    for (const provider of providers) {
-        const model = googleModels.find(m => m.provider === provider);
-        if (model) return model;
-    }
-    
-    // Return first available Google model if any
-    return googleModels[0];
+
+    const models = ctx.modelRegistry.getAvailable().filter(isSupportedSearchModel);
+    if (models.length === 0) return undefined;
+
+    return models.sort((a, b) => {
+        const byProvider = providerPriority(a) - providerPriority(b);
+        if (byProvider !== 0) return byProvider;
+        return modelPriority(a) - modelPriority(b);
+    })[0];
 }
 
 // --- Error Results ---
 
 export function missingConfigResult(ctx: ExtensionContext): AgentToolResult<any> {
-    const msg = ctx.model && ["google-gemini-cli", "google-antigravity"].includes(ctx.model.provider)
-        ? `Provider ${ctx.model.provider} requires valid OAuth credentials.`
-        : "No Google Gemini configuration found. Please configure GEMINI_API_KEY.";
+    const current = ctx.model ? `${ctx.model.provider} (${ctx.model.api})` : "none";
+    const msg = `No supported web-search model configuration found. Current model: ${current}. Configure or select a supported provider: google-generative-ai, openai, or anthropic.`;
     return { content: [{ type: "text", text: `Failed: ${msg}` }], details: { error: "missing_config" } };
 }
 

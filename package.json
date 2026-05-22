@@ -1,16 +1,18 @@
 {
   "name": "pi-web-search",
-  "version": "1.1.0",
-  "description": "Web search and content analysis extension for pi, powered by Gemini API",
+  "version": "1.2.0",
+  "description": "Provider-native web search for pi across Google Gemini, OpenAI, and Anthropic, plus Gemini URL Context",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "src/index.ts",
   "keywords": [
     "pi",
     "pi-extension",
     "web-search",
     "gemini",
     "google",
+    "openai",
+    "anthropic",
+    "url-context",
     "url-analysis",
     "youtube"
   ],
@@ -24,11 +26,21 @@
     "url": "https://github.com/ttttmr/pi-web-search/issues"
   },
   "homepage": "https://github.com/ttttmr/pi-web-search#readme",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:real:web-search": "node tests/real-web-search.mjs",
+    "test:real:url-context": "node tests/real-url-context.mjs"
+  },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.64.0",
-    "@sinclair/typebox": "^0.32.15",
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "@earendil-works/pi-ai": "^0.75.4",
+    "@earendil-works/pi-coding-agent": "^0.75.4",
+    "@sinclair/typebox": "^0.34.49",
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3"
   },
   "pi": {
     "extensions": [

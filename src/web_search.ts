@@ -1,7 +1,7 @@
-import type { ExtensionContext, AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext, AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { callApiStream, getConfig, applyCitations } from "./api.js";
-import { getModel, missingConfigResult, errorResult, formatResult } from "./utils.js";
+import { callApiStream, getConfig, applyCitations } from "./api.ts";
+import { getModel, missingConfigResult, errorResult, formatResult } from "./utils.ts";
 
 export const WebSearchSchema = Type.Object({
     query: Type.String({ description: "The search query or question to answer" }),
@@ -43,17 +43,23 @@ export async function webSearch(
             ? `${params.query}\n\nAlso analyze these URLs:\n${params.urls!.join("\n")}`
             : params.query;
 
-        // Enable google_search, add url_context if URLs provided
-        const tools = hasUrls
-            ? [{ [config.searchTool]: {} }, { [config.urlContextTool]: {} }]
-            : [{ [config.searchTool]: {} }];
+        // Enable provider-native search tools. Google needs explicit Gemini tool names;
+        // OpenAI/Anthropic are handled inside callApiStream based on the current model.
+        const tools = config.kind === "google"
+            ? (hasUrls
+                ? [{ [config.searchTool!]: {} }, { [config.urlContextTool!]: {} }]
+                : [{ [config.searchTool!]: {} }])
+            : undefined;
 
         const result = await callApiStream(ctx, model, {
             contents: [{ role: "user", parts: [{ text: prompt }] }],
-            tools
+            ...(tools ? { tools } : {})
         }, onUpdate, signal);
 
-        const { text, sources } = applyCitations(result.text, result.groundingMetadata);
+        const cited = applyCitations(result.text, result.groundingMetadata);
+        const text = cited.text;
+        const sources = result.sources?.length ? result.sources : cited.sources;
+        const extraSearchResults = (result.searchResults || []).filter((item) => item.url && !sources.some((source) => source.url === item.url));
 
         // Handle URL context metadata
         const urlMeta = result.urlContextMetadata?.urlMetadata 
@@ -78,18 +84,42 @@ export async function webSearch(
             failed.forEach((f: any) => { summary += `\n- ${f.url}: ${f.status}`; });
         }
 
+        if (result.nativeSearchUsed === false) {
+            summary += `\n\n## Search Verification\n⚠️ No verified native search metadata was returned by provider ${result.providerKind || "unknown"}. Treat the answer as ungrounded unless sources/searchResults are present in tool details.`;
+        }
+
         // Add sources
         if (sources.length > 0) {
             summary += `\n\n## Sources\n${sources.map((s, i) => `${i + 1}. [${s.title}](${s.url})`).join("\n")}`;
         }
 
+        if (extraSearchResults.length) {
+            const visibleResults = extraSearchResults.slice(0, 8);
+            summary += `\n\n## Additional Search Results\n${visibleResults.map((r, i) => {
+                const label = r.title || r.url || `Result ${i + 1}`;
+                const url = r.url ? ` - ${r.url}` : "";
+                const meta = [r.source, r.type, r.status, r.query ? `query=${r.query}` : undefined].filter(Boolean).join(", ");
+                return `${i + 1}. ${label}${url}${meta ? ` (${meta})` : ""}`;
+            }).join("\n")}`;
+            if (extraSearchResults.length > visibleResults.length) {
+                summary += `\n... and ${extraSearchResults.length - visibleResults.length} more results in tool details.`;
+            }
+        }
+
         return formatResult(summary, {
             sources,
-            searchQueries: result.groundingMetadata?.webSearchQueries,
+            providerKind: result.providerKind,
+            nativeSearchUsed: result.nativeSearchUsed,
+            nativeSearchEvents: result.nativeSearchEvents,
+            nativeSearchCalls: result.nativeSearchCalls,
+            searchQueries: result.searchQueries || result.groundingMetadata?.webSearchQueries,
+            searchResults: result.searchResults,
+            citations: result.citations,
             retrieved: retrieved.length > 0 ? retrieved : undefined,
             failed: failed.length > 0 ? failed : undefined,
             model: model.id,
-            grounded: sources.length > 0
+            grounded: sources.length > 0 || (result.searchResults?.length || 0) > 0,
+            resultCount: result.searchResults?.length || sources.length
         });
     } catch (e: any) {
         return errorResult(e);
