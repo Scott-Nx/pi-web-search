@@ -1,7 +1,7 @@
 import type { ExtensionContext, AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { callApiStream, getConfig, applyCitations } from "./api.ts";
-import { getModel, missingConfigResult, errorResult, formatResult } from "./utils.ts";
+import { getWebSearchModel, missingWebSearchConfigResult, errorResult, formatResult } from "./utils.ts";
 
 export const WebSearchSchema = Type.Object({
     query: Type.String({ description: "The search query or question to answer" }),
@@ -19,8 +19,8 @@ export async function webSearch(
     onUpdate: AgentToolUpdateCallback | undefined, 
     ctx: ExtensionContext
 ) {
-    const model = await getModel(ctx);
-    if (!model) return missingConfigResult(ctx);
+    const model = await getWebSearchModel(ctx);
+    if (!model) return missingWebSearchConfigResult(ctx);
 
     const hasUrls = params.urls && params.urls.length > 0;
     const urlCount = hasUrls ? params.urls!.length : 0;
@@ -82,10 +82,6 @@ export async function webSearch(
         if (failed.length > 0) {
             summary += `\n\n## URL Status\n✅ Retrieved: ${retrieved.length}\n❌ Failed: ${failed.length}`;
             failed.forEach((f: any) => { summary += `\n- ${f.url}: ${f.status}`; });
-        }
-
-        if (result.nativeSearchUsed === false) {
-            summary += `\n\n## Search Verification\n⚠️ No verified native search metadata was returned by provider ${result.providerKind || "unknown"}. Treat the answer as ungrounded unless sources/searchResults are present in tool details.`;
         }
 
         // Add sources

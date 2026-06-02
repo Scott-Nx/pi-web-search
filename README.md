@@ -30,7 +30,18 @@ pi install npm:pi-web-search
 
 ## Usage
 
-No extra config needed. Just configure any supported provider in pi and the tools auto-detect it.
+No extra config needed. Select a supported current model in pi and the tools auto-detect the matching provider API.
+
+`web_search` will not scan configured models and pick one automatically when the current model does not support native search. To use a dedicated search model, opt in explicitly with `~/.pi/agent/web-search.json`:
+
+```json
+{
+  "provider": "openai",
+  "model": "gpt-5.1"
+}
+```
+
+When this file exists, `web_search` uses the configured provider/model first. If it is missing, `web_search` uses the current conversation model. If the selected model does not support native search, the tool returns an error instead of falling back.
 
 `url_context` is automatically removed from active tools when using a non-Gemini model.
 

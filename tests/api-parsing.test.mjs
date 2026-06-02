@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { callApiStream } from '../src/api.ts';
 import { createModelScopedToolManager } from '../src/index.ts';
+import { getModel, getWebSearchModel, missingConfigResult, missingWebSearchConfigResult } from '../src/utils.ts';
 import { urlContext } from '../src/url_context.ts';
+import { webSearch } from '../src/web_search.ts';
 
 function sse(events) {
   return events.map((event) => {
@@ -170,6 +175,127 @@ test('Google stream exposes grounding queries, chunks, support citations, and re
   }
 });
 
+test('getModel does not fall back to another configured supported model', async () => {
+  const currentModel = {
+    id: 'local-test',
+    provider: 'local-provider',
+    api: 'openai-chat-completions',
+    baseUrl: 'https://example.test/local',
+    headers: {},
+  };
+  const supportedModel = {
+    id: 'gpt-test',
+    provider: 'proxy-provider',
+    api: 'openai-responses',
+    baseUrl: 'https://example.test/v1',
+    headers: {},
+  };
+  const ctx = {
+    model: currentModel,
+    modelRegistry: {
+      getAvailable() {
+        return [currentModel, supportedModel];
+      },
+    },
+  };
+
+  assert.equal(await getModel(ctx), undefined);
+  const result = missingConfigResult(ctx);
+  assert.match(result.content[0].text, /will not switch to another configured model automatically/i);
+  assert.match(result.content[0].text, /gpt-test/);
+  assert.equal(result.details.error, 'unsupported_model');
+  assert.deepEqual(result.details.availableSupportedModels, ['gpt-test (proxy-provider/openai-responses)']);
+});
+
+test('getWebSearchModel prefers explicit config over current conversation model', async () => {
+  const previousConfigPath = process.env.PI_WEB_SEARCH_CONFIG;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-web-search-test-'));
+  const configPath = join(dir, 'web-search.json');
+  const currentModel = {
+    id: 'current-test',
+    provider: 'current-provider',
+    api: 'openai-responses',
+    baseUrl: 'https://example.test/current',
+    headers: {},
+  };
+  const configuredModel = {
+    id: 'gpt-test',
+    provider: 'proxy-provider',
+    api: 'openai-responses',
+    baseUrl: 'https://example.test/v1',
+    headers: {},
+  };
+  const ctx = {
+    model: currentModel,
+    modelRegistry: {
+      find(provider, modelId) {
+        return provider === configuredModel.provider && modelId === configuredModel.id ? configuredModel : undefined;
+      },
+      getAvailable() {
+        return [currentModel, configuredModel];
+      },
+    },
+  };
+
+  try {
+    process.env.PI_WEB_SEARCH_CONFIG = configPath;
+    await writeFile(configPath, JSON.stringify({ provider: 'proxy-provider', model: 'gpt-test' }));
+
+    assert.equal(await getWebSearchModel(ctx), configuredModel);
+  } finally {
+    if (previousConfigPath === undefined) delete process.env.PI_WEB_SEARCH_CONFIG;
+    else process.env.PI_WEB_SEARCH_CONFIG = previousConfigPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('getWebSearchModel reports unsupported configured model instead of falling back', async () => {
+  const previousConfigPath = process.env.PI_WEB_SEARCH_CONFIG;
+  const dir = await mkdtemp(join(tmpdir(), 'pi-web-search-test-'));
+  const configPath = join(dir, 'web-search.json');
+  const currentModel = {
+    id: 'current-test',
+    provider: 'current-provider',
+    api: 'openai-responses',
+    baseUrl: 'https://example.test/current',
+    headers: {},
+  };
+  const unsupportedConfiguredModel = {
+    id: 'local-test',
+    provider: 'local-provider',
+    api: 'openai-chat-completions',
+    baseUrl: 'https://example.test/local',
+    headers: {},
+  };
+  const ctx = {
+    model: currentModel,
+    modelRegistry: {
+      find(provider, modelId) {
+        return provider === unsupportedConfiguredModel.provider && modelId === unsupportedConfiguredModel.id ? unsupportedConfiguredModel : undefined;
+      },
+      getAvailable() {
+        return [currentModel];
+      },
+    },
+  };
+
+  try {
+    process.env.PI_WEB_SEARCH_CONFIG = configPath;
+    await writeFile(configPath, JSON.stringify({ provider: 'local-provider', model: 'local-test' }));
+
+    assert.equal(await getWebSearchModel(ctx), undefined);
+    const result = missingWebSearchConfigResult(ctx);
+    assert.match(result.content[0].text, /Configured web search model local-test/i);
+    assert.match(result.content[0].text, /does not support native web search/i);
+    assert.equal(result.details.error, 'unsupported_model');
+    assert.equal(result.details.configPath, configPath);
+  } finally {
+    if (previousConfigPath === undefined) delete process.env.PI_WEB_SEARCH_CONFIG;
+    else process.env.PI_WEB_SEARCH_CONFIG = previousConfigPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('url_context rejects non-Gemini providers with a clear error', async () => {
   const model = {
     id: 'gpt-test',
@@ -222,6 +348,44 @@ test('url_context warns when Gemini returns no verified URL context metadata', a
     assert.deepEqual(result.details.sources, []);
   } finally {
     globalThis.fetch = previousFetch;
+  }
+});
+
+test('web_search does not add visible verification warning when native metadata is absent', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousConfigPath = process.env.PI_WEB_SEARCH_CONFIG;
+  process.env.PI_WEB_SEARCH_CONFIG = join(tmpdir(), `pi-web-search-missing-${process.pid}.json`);
+  globalThis.fetch = async () => makeResponse([
+    { data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'Ungrounded answer without metadata.' } } },
+  ]);
+
+  try {
+    const model = {
+      id: 'claude-test',
+      provider: 'proxy-provider',
+      api: 'anthropic-messages',
+      baseUrl: 'https://example.test/anthropic',
+      maxTokens: 4096,
+      headers: {},
+    };
+
+    const result = await webSearch(
+      'tool-3',
+      { query: 'Search something' },
+      new AbortController().signal,
+      undefined,
+      mockCtx('test-key', model),
+    );
+
+    assert.doesNotMatch(result.content[0].text, /Search Verification/i);
+    assert.doesNotMatch(result.content[0].text, /No verified native search metadata/i);
+    assert.equal(result.details.providerKind, 'anthropic');
+    assert.equal(result.details.nativeSearchUsed, false);
+    assert.equal(result.details.grounded, false);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousConfigPath === undefined) delete process.env.PI_WEB_SEARCH_CONFIG;
+    else process.env.PI_WEB_SEARCH_CONFIG = previousConfigPath;
   }
 });
 
